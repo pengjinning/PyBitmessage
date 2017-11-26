@@ -5,14 +5,20 @@ import sys
 import time
 
 import account
+from bmconfigparser import BMConfigParser
 from debug import logger
+import defaults
 from foldertree import AccountMixin
 from helper_sql import *
 from l10n import getTranslationLanguage
-from openclpow import has_opencl
-from proofofwork import bmpow
+from openclpow import openclAvailable, openclEnabled
+import paths
+import proofofwork
 from pyelliptic.openssl import OpenSSL
-import shared
+import queues
+import network.stats
+import state
+from version import softwareVersion
 
 # this is BM support address going to Peter Surda
 SUPPORT_ADDRESS = 'BM-2cTkCtMYkrSPwFTpgcBrMrf5d8oZwvMZWK'
@@ -31,7 +37,7 @@ Please describe what happens instead:
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Please write above this line and if possible, keep the information about your environment below intact.
 
-PyBitmesage version: {}
+PyBitmessage version: {}
 Operating system: {}
 Architecture: {}bit
 Python Version: {}
@@ -55,14 +61,14 @@ def checkAddressBook(myapp):
 def checkHasNormalAddress():
     for address in account.getSortedAccounts():
         acct = account.accountClass(address)
-        if acct.type == AccountMixin.NORMAL and shared.safeConfigGetBoolean(address, 'enabled'):
+        if acct.type == AccountMixin.NORMAL and BMConfigParser().safeGetBoolean(address, 'enabled'):
             return address
     return False
 
 def createAddressIfNeeded(myapp):
     if not checkHasNormalAddress():
-        shared.addressGeneratorQueue.put(('createRandomAddress', 4, 1, str(QtGui.QApplication.translate("Support", SUPPORT_MY_LABEL)), 1, "", False, shared.networkDefaultProofOfWorkNonceTrialsPerByte, shared.networkDefaultPayloadLengthExtraBytes))
-    while shared.shutdown == 0 and not checkHasNormalAddress():
+        queues.addressGeneratorQueue.put(('createRandomAddress', 4, 1, str(QtGui.QApplication.translate("Support", SUPPORT_MY_LABEL)), 1, "", False, defaults.networkDefaultProofOfWorkNonceTrialsPerByte, defaults.networkDefaultPayloadLengthExtraBytes))
+    while state.shutdown == 0 and not checkHasNormalAddress():
         time.sleep(.2)
     myapp.rerenderComboBoxSendFrom()
     return checkHasNormalAddress()
@@ -70,7 +76,7 @@ def createAddressIfNeeded(myapp):
 def createSupportMessage(myapp):
     checkAddressBook(myapp)
     address = createAddressIfNeeded(myapp)
-    if shared.shutdown:
+    if state.shutdown:
         return
 
     myapp.ui.lineEditSubject.setText(str(QtGui.QApplication.translate("Support", SUPPORT_SUBJECT)))
@@ -80,7 +86,11 @@ def createSupportMessage(myapp):
     myapp.ui.comboBoxSendFrom.setCurrentIndex(addrIndex)
     myapp.ui.lineEditTo.setText(SUPPORT_ADDRESS)
     
-    version = shared.softwareVersion
+    version = softwareVersion
+    commit = paths.lastCommit()
+    if commit:
+        version += " GIT " + commit
+
     os = sys.platform
     if os == "win32":
         windowsversion = sys.getwindowsversion()
@@ -95,30 +105,26 @@ def createSupportMessage(myapp):
     architecture = "32" if ctypes.sizeof(ctypes.c_voidp) == 4 else "64"
     pythonversion = sys.version
     
-    SSLEAY_VERSION = 0
-    OpenSSL._lib.SSLeay.restype = ctypes.c_long
-    OpenSSL._lib.SSLeay_version.restype = ctypes.c_char_p
-    OpenSSL._lib.SSLeay_version.argtypes = [ctypes.c_int]
-    opensslversion = "%s (Python internal), %s (external for PyElliptic)" % (ssl.OPENSSL_VERSION, OpenSSL._lib.SSLeay_version(SSLEAY_VERSION))
+    opensslversion = "%s (Python internal), %s (external for PyElliptic)" % (ssl.OPENSSL_VERSION, OpenSSL._version)
 
     frozen = "N/A"
-    if shared.frozen:
-        frozen = shared.frozen
-    portablemode = "True" if shared.appdata == shared.lookupExeFolder() else "False"
-    cpow = "True" if bmpow else "False"
+    if paths.frozen:
+        frozen = paths.frozen
+    portablemode = "True" if state.appdata == paths.lookupExeFolder() else "False"
+    cpow = "True" if proofofwork.bmpow else "False"
     #cpow = QtGui.QApplication.translate("Support", cpow)
-    openclpow = "True" if shared.safeConfigGetBoolean('bitmessagesettings', 'opencl') and has_opencl() else "False"
+    openclpow = str(BMConfigParser().safeGet('bitmessagesettings', 'opencl')) if openclEnabled() else "None"
     #openclpow = QtGui.QApplication.translate("Support", openclpow)
     locale = getTranslationLanguage()
     try:
-        socks = shared.config.get('bitmessagesettings', 'socksproxytype')
+        socks = BMConfigParser().get('bitmessagesettings', 'socksproxytype')
     except:
         socks = "N/A"
     try:
-        upnp = shared.config.get('bitmessagesettings', 'upnp')
+        upnp = BMConfigParser().get('bitmessagesettings', 'upnp')
     except:
         upnp = "N/A"
-    connectedhosts = len(shared.connectedHostsList)
+    connectedhosts = len(network.stats.connectedHostsList())
 
     myapp.ui.textEditMessage.setText(str(QtGui.QApplication.translate("Support", SUPPORT_MESSAGE)).format(version, os, architecture, pythonversion, opensslversion, frozen, portablemode, cpow, openclpow, locale, socks, upnp, connectedhosts))
 

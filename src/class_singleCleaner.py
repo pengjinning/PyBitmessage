@@ -3,12 +3,18 @@ import shared
 import time
 import sys
 import os
-import pickle
 
 import tr#anslate
+from bmconfigparser import BMConfigParser
 from helper_sql import *
 from helper_threading import *
+from inventory import Inventory
+from network.connectionpool import BMConnectionPool
 from debug import logger
+import knownnodes
+import queues
+import protocol
+import state
 
 """
 The singleCleaner class is a timer-driven thread that cleans data structures 
@@ -21,6 +27,7 @@ inventorySets (clears then reloads data out of sql database)
 It cleans these tables on the disk:
 inventory (clears expired objects)
 pubkeys (clears pubkeys older than 4 weeks old which we have not used personally)
+knownNodes (clears addresses which have not been online for over 3 days)
 
 It resends messages when there has been no response:
 resends getpubkey messages in 5 days (then 10 days, then 20 days, etc...)
@@ -30,6 +37,8 @@ resends msg messages in 5 days (then 10 days, then 20 days, etc...)
 
 
 class singleCleaner(threading.Thread, StoppableThread):
+    cycleLength = 300
+    expireDiscoveredPeers = 300
 
     def __init__(self):
         threading.Thread.__init__(self, name="singleCleaner")
@@ -38,27 +47,31 @@ class singleCleaner(threading.Thread, StoppableThread):
     def run(self):
         timeWeLastClearedInventoryAndPubkeysTables = 0
         try:
-            shared.maximumLengthOfTimeToBotherResendingMessages = (float(shared.config.get('bitmessagesettings', 'stopresendingafterxdays')) * 24 * 60 * 60) + (float(shared.config.get('bitmessagesettings', 'stopresendingafterxmonths')) * (60 * 60 * 24 *365)/12)
+            shared.maximumLengthOfTimeToBotherResendingMessages = (float(BMConfigParser().get('bitmessagesettings', 'stopresendingafterxdays')) * 24 * 60 * 60) + (float(BMConfigParser().get('bitmessagesettings', 'stopresendingafterxmonths')) * (60 * 60 * 24 *365)/12)
         except:
             # Either the user hasn't set stopresendingafterxdays and stopresendingafterxmonths yet or the options are missing from the config file.
             shared.maximumLengthOfTimeToBotherResendingMessages = float('inf')
 
-        while shared.shutdown == 0:
-            shared.UISignalQueue.put((
+        # initial wait
+        if state.shutdown == 0:
+            self.stop.wait(singleCleaner.cycleLength)
+
+        while state.shutdown == 0:
+            queues.UISignalQueue.put((
                 'updateStatusBar', 'Doing housekeeping (Flushing inventory in memory to disk...)'))
-            shared.inventory.flush()
-            shared.UISignalQueue.put(('updateStatusBar', ''))
+            Inventory().flush()
+            queues.UISignalQueue.put(('updateStatusBar', ''))
             
-            shared.broadcastToSendDataQueues((
+            protocol.broadcastToSendDataQueues((
                 0, 'pong', 'no data')) # commands the sendData threads to send out a pong message if they haven't sent anything else in the last five minutes. The socket timeout-time is 10 minutes.
             # If we are running as a daemon then we are going to fill up the UI
             # queue which will never be handled by a UI. We should clear it to
             # save memory.
-            if shared.safeConfigGetBoolean('bitmessagesettings', 'daemon'):
-                shared.UISignalQueue.queue.clear()
+            if BMConfigParser().safeGetBoolean('bitmessagesettings', 'daemon'):
+                queues.UISignalQueue.queue.clear()
             if timeWeLastClearedInventoryAndPubkeysTables < int(time.time()) - 7380:
                 timeWeLastClearedInventoryAndPubkeysTables = int(time.time())
-                shared.inventory.clean()
+                Inventory().clean()
                 # pubkeys
                 sqlExecute(
                     '''DELETE FROM pubkeys WHERE time<? AND usedpersonally='no' ''',
@@ -80,44 +93,74 @@ class singleCleaner(threading.Thread, StoppableThread):
                     elif status == 'msgsent':
                         resendMsg(ackData)
 
+            # cleanup old nodes
+            now = int(time.time())
+            toDelete = []
+            with knownnodes.knownNodesLock:
+                for stream in knownnodes.knownNodes:
+                    for node in knownnodes.knownNodes[stream].keys():
+                        try:
+                            if now - knownnodes.knownNodes[stream][node]["lastseen"] > 2419200: # 28 days
+                                shared.needToWriteKownNodesToDisk = True
+                                del knownnodes.knownNodes[stream][node]
+                        except TypeError:
+                            print "Error in %s" % (str(node))
+
             # Let us write out the knowNodes to disk if there is anything new to write out.
             if shared.needToWriteKnownNodesToDisk:
-                shared.knownNodesLock.acquire()
-                output = open(shared.appdata + 'knownnodes.dat', 'wb')
                 try:
-                    pickle.dump(shared.knownNodes, output)
-                    output.close()
+                    knownnodes.saveKnownNodes()
                 except Exception as err:
                     if "Errno 28" in str(err):
-                        logger.fatal('(while receiveDataThread shared.needToWriteKnownNodesToDisk) Alert: Your disk or data storage volume is full. ')
-                        shared.UISignalQueue.put(('alert', (tr._translate("MainWindow", "Disk full"), tr._translate("MainWindow", 'Alert: Your disk or data storage volume is full. Bitmessage will now exit.'), True)))
+                        logger.fatal('(while receiveDataThread knownnodes.needToWriteKnownNodesToDisk) Alert: Your disk or data storage volume is full. ')
+                        queues.UISignalQueue.put(('alert', (tr._translate("MainWindow", "Disk full"), tr._translate("MainWindow", 'Alert: Your disk or data storage volume is full. Bitmessage will now exit.'), True)))
                         if shared.daemon:
                             os._exit(0)
-                shared.knownNodesLock.release()
                 shared.needToWriteKnownNodesToDisk = False
-            self.stop.wait(300)
+
+            # clear download queues
+            for thread in threading.enumerate():
+                if thread.isAlive() and hasattr(thread, 'downloadQueue'):
+                    thread.downloadQueue.clear()
+
+            # inv/object tracking
+            for connection in BMConnectionPool().inboundConnections.values() + BMConnectionPool().outboundConnections.values():
+                connection.clean()
+
+            # discovery tracking
+            exp = time.time() - singleCleaner.expireDiscoveredPeers
+            reaper = (k for k, v in state.discoveredPeers.items() if v < exp)
+            for k in reaper:
+                try:
+                    del state.discoveredPeers[k]
+                except KeyError:
+                    pass
+            # TODO: cleanup pending upload / download
+
+            if state.shutdown == 0:
+                self.stop.wait(singleCleaner.cycleLength)
 
 
 def resendPubkeyRequest(address):
     logger.debug('It has been a long time and we haven\'t heard a response to our getpubkey request. Sending again.')
     try:
-        del shared.neededPubkeys[
-            address] # We need to take this entry out of the shared.neededPubkeys structure because the shared.workerQueue checks to see whether the entry is already present and will not do the POW and send the message because it assumes that it has already done it recently.
+        del state.neededPubkeys[
+            address] # We need to take this entry out of the neededPubkeys structure because the queues.workerQueue checks to see whether the entry is already present and will not do the POW and send the message because it assumes that it has already done it recently.
     except:
         pass
 
-    shared.UISignalQueue.put((
+    queues.UISignalQueue.put((
          'updateStatusBar', 'Doing work necessary to again attempt to request a public key...'))
     sqlExecute(
         '''UPDATE sent SET status='msgqueued' WHERE toaddress=?''',
         address)
-    shared.workerQueue.put(('sendmessage', ''))
+    queues.workerQueue.put(('sendmessage', ''))
 
 def resendMsg(ackdata):
     logger.debug('It has been a long time and we haven\'t heard an acknowledgement to our msg. Sending again.')
     sqlExecute(
         '''UPDATE sent SET status='msgqueued' WHERE ackdata=?''',
         ackdata)
-    shared.workerQueue.put(('sendmessage', ''))
-    shared.UISignalQueue.put((
+    queues.workerQueue.put(('sendmessage', ''))
+    queues.UISignalQueue.put((
     'updateStatusBar', 'Doing work necessary to again attempt to deliver a message...'))

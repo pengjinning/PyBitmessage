@@ -8,13 +8,13 @@
 # WARNING! All changes made in this file will be lost!
 
 from PyQt4 import QtCore, QtGui
+from bmconfigparser import BMConfigParser
 from foldertree import AddressBookCompleter
 from messageview import MessageView
 from messagecompose import MessageCompose
 import settingsmixin
 from networkstatus import NetworkStatus
 from blacklist import Blacklist
-import shared
 
 try:
     _fromUtf8 = QtCore.QString.fromUtf8
@@ -197,9 +197,6 @@ class Ui_MainWindow(object):
         self.verticalSplitter_2.addWidget(self.pushButtonAddAddressBook)
         self.pushButtonFetchNamecoinID = QtGui.QPushButton(self.send)
         self.pushButtonFetchNamecoinID.resize(200, self.pushButtonFetchNamecoinID.height())
-        font = QtGui.QFont()
-        font.setPointSize(9)
-        self.pushButtonFetchNamecoinID.setFont(font)
         self.pushButtonFetchNamecoinID.setObjectName(_fromUtf8("pushButtonFetchNamecoinID"))
         self.verticalSplitter_2.addWidget(self.pushButtonFetchNamecoinID)
         self.verticalSplitter_2.setStretchFactor(0, 1)
@@ -325,7 +322,7 @@ class Ui_MainWindow(object):
         self.pushButtonTTL.setObjectName(_fromUtf8("pushButtonTTL"))
         self.horizontalLayout_5.addWidget(self.pushButtonTTL, 0, QtCore.Qt.AlignRight)
         self.horizontalSliderTTL = QtGui.QSlider(self.send)
-        self.horizontalSliderTTL.setMinimumSize(QtCore.QSize(35, 0))
+        self.horizontalSliderTTL.setMinimumSize(QtCore.QSize(70, 0))
         self.horizontalSliderTTL.setOrientation(QtCore.Qt.Horizontal)
         self.horizontalSliderTTL.setInvertedAppearance(False)
         self.horizontalSliderTTL.setInvertedControls(False)
@@ -343,7 +340,7 @@ class Ui_MainWindow(object):
         self.pushButtonSend = QtGui.QPushButton(self.send)
         self.pushButtonSend.setObjectName(_fromUtf8("pushButtonSend"))
         self.horizontalLayout_5.addWidget(self.pushButtonSend, 0, QtCore.Qt.AlignRight)
-        self.horizontalSliderTTL.setMaximumSize(QtCore.QSize(70, self.pushButtonSend.height()))
+        self.horizontalSliderTTL.setMaximumSize(QtCore.QSize(105, self.pushButtonSend.height()))
         self.verticalSplitter.addWidget(self.tTLContainer)
         self.tTLContainer.adjustSize()
         self.verticalSplitter.setStretchFactor(1, 0)
@@ -559,7 +556,7 @@ class Ui_MainWindow(object):
         self.blackwhitelist = Blacklist()
         self.tabWidget.addTab(self.blackwhitelist, QtGui.QIcon(":/newPrefix/images/blacklist.png"), "")
         # Initialize the Blacklist or Whitelist
-        if shared.config.get('bitmessagesettings', 'blackwhitelist') == 'white':
+        if BMConfigParser().get('bitmessagesettings', 'blackwhitelist') == 'white':
             self.blackwhitelist.radioButtonWhitelist.click()
         self.blackwhitelist.rerenderBlackWhiteList()
 
@@ -683,7 +680,7 @@ class Ui_MainWindow(object):
         self.pushButtonTTL.setText(_translate("MainWindow", "TTL:", None))
         hours = 48
         try:
-            hours = int(shared.config.getint('bitmessagesettings', 'ttl')/60/60)
+            hours = int(BMConfigParser().getint('bitmessagesettings', 'ttl')/60/60)
         except:
             pass
         self.labelHumanFriendlyTTLDescription.setText(_translate("MainWindow", "%n hour(s)", None, QtCore.QCoreApplication.CodecForTr, hours))

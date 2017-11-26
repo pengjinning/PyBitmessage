@@ -1,8 +1,25 @@
+import os
 import socket
 import sys
 from binascii import hexlify, unhexlify
+from multiprocessing import current_process
+from threading import current_thread, enumerate
+import traceback
 
-import shared
+from bmconfigparser import BMConfigParser
+from debug import logger
+import queues
+import shutdown
+
+def powQueueSize():
+    curWorkerQueue = queues.workerQueue.qsize()
+    for thread in enumerate():
+        try:
+            if thread.name == "singleWorker":
+                curWorkerQueue += thread.busy
+        except:
+            pass
+    return curWorkerQueue
 
 def convertIntToString(n):
     a = __builtins__.hex(n)
@@ -13,16 +30,34 @@ def convertIntToString(n):
     else:
         return unhexlify('0' + a[2:])
 
-
 def convertStringToInt(s):
     return int(hexlify(s), 16)
 
+def allThreadTraceback(frame):
+    id2name = dict([(th.ident, th.name) for th in enumerate()])
+    code = []
+    for threadId, stack in sys._current_frames().items():
+        code.append("\n# Thread: %s(%d)" % (id2name.get(threadId,""), threadId))
+        for filename, lineno, name, line in traceback.extract_stack(stack):
+            code.append('File: "%s", line %d, in %s' % (filename, lineno, name))
+            if line:
+                code.append("  %s" % (line.strip()))
+    print "\n".join(code)
 
 def signal_handler(signal, frame):
-    if shared.safeConfigGetBoolean('bitmessagesettings', 'daemon'):
-        shared.doCleanShutdown()
-        sys.exit(0)
+    logger.error("Got signal %i in %s/%s", signal, current_process().name, current_thread().name)
+    if current_process().name == "RegExParser":
+        # on Windows this isn't triggered, but it's fine, it has its own process termination thing
+        raise SystemExit
+    if "PoolWorker" in current_process().name:
+        raise SystemExit
+    if current_thread().name != "MainThread":
+        return
+    logger.error("Got signal %i", signal)
+    if BMConfigParser().safeGetBoolean('bitmessagesettings', 'daemon'):
+        shutdown.doCleanShutdown()
     else:
+        allThreadTraceback(frame)
         print 'Unfortunately you cannot use Ctrl+C when running the UI because the UI captures the signal.'
 
 def isHostInPrivateIPRange(host):
@@ -35,7 +70,7 @@ def isHostInPrivateIPRange(host):
         if (ord(hostAddr[0]) & 0xfe) == 0xfc:
             return False
         pass
-    else:
+    elif ".onion" not in host:
         if host[:3] == '10.':
             return True
         if host[:4] == '172.':
@@ -43,6 +78,9 @@ def isHostInPrivateIPRange(host):
                 if int(host[4:6]) >= 16 and int(host[4:6]) <= 31:
                     return True
         if host[:8] == '192.168.':
+            return True
+        # Multicast
+        if host[:3] >= 224 and host[:3] <= 239 and host[4] == '.':
             return True
     return False
 

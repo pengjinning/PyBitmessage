@@ -13,8 +13,11 @@ SOURCES	= 	../addresses.py\
 			../helper_bootstrap.py\
 			../helper_generic.py\
 			../helper_inbox.py\
+			../helper_msgcoding.py\
 			../helper_sent.py\
 			../helper_startup.py\
+                        ../namecoin.py\
+			../proofofwork.py\
 			../shared.py\
 			../upnp.py\
 			../bitmessageqt/__init__.py\
@@ -38,11 +41,13 @@ SOURCES	= 	../addresses.py\
 			../bitmessageqt/regenerateaddresses.py\
 			../bitmessageqt/safehtmlparser.py\
 			../bitmessageqt/settings.py\
-			../bitmessageqt/specialaddressbehavior.py
+                        ../bitmessageqt/specialaddressbehavior.py\
+                        ../plugins/qrcodeui.py
 
 FORMS = \
     ../bitmessageqt/blacklist.ui\
-    ../bitmessageqt/networkstatus.ui
+    ../bitmessageqt/networkstatus.ui\
+    ../bitmessageqt/newchandialog.ui
 
 TRANSLATIONS = \
     bitmessage_ar.ts \
@@ -57,8 +62,11 @@ TRANSLATIONS = \
     bitmessage_ja.ts \
     bitmessage_nl.ts \
     bitmessage_no.ts \
+    bitmessage_pl.ts \
+    bitmessage_pt.ts \
     bitmessage_sk.ts \
     bitmessage_ru.ts \
     bitmessage_zh_cn.ts
 
 CODECFORTR      = UTF-8
+CODECFORSRC     = UTF-8

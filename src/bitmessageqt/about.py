@@ -23,6 +23,7 @@ except AttributeError:
     def _translate(context, text, disambig):
         return QtGui.QApplication.translate(context, text, disambig)
 
+
 class Ui_aboutDialog(object):
     def setupUi(self, aboutDialog):
         aboutDialog.setObjectName(_fromUtf8("aboutDialog"))
@@ -33,16 +34,17 @@ class Ui_aboutDialog(object):
         self.buttonBox.setStandardButtons(QtGui.QDialogButtonBox.Ok)
         self.buttonBox.setObjectName(_fromUtf8("buttonBox"))
         self.label = QtGui.QLabel(aboutDialog)
-        self.label.setGeometry(QtCore.QRect(70, 126, 111, 20))
+        self.label.setGeometry(QtCore.QRect(10, 106, 341, 20))
         font = QtGui.QFont()
         font.setBold(True)
         font.setWeight(75)
         self.label.setFont(font)
-        self.label.setAlignment(QtCore.Qt.AlignRight|QtCore.Qt.AlignTrailing|QtCore.Qt.AlignVCenter)
+        self.label.setAlignment(QtCore.Qt.AlignCenter|QtCore.Qt.AlignVCenter)
         self.label.setObjectName(_fromUtf8("label"))
         self.labelVersion = QtGui.QLabel(aboutDialog)
-        self.labelVersion.setGeometry(QtCore.QRect(190, 126, 161, 20))
+        self.labelVersion.setGeometry(QtCore.QRect(10, 116, 341, 41))
         self.labelVersion.setObjectName(_fromUtf8("labelVersion"))
+        self.labelVersion.setAlignment(QtCore.Qt.AlignCenter|QtCore.Qt.AlignVCenter)
         self.label_2 = QtGui.QLabel(aboutDialog)
         self.label_2.setGeometry(QtCore.QRect(10, 150, 341, 41))
         self.label_2.setAlignment(QtCore.Qt.AlignCenter)
@@ -66,7 +68,7 @@ class Ui_aboutDialog(object):
         aboutDialog.setWindowTitle(_translate("aboutDialog", "About", None))
         self.label.setText(_translate("aboutDialog", "PyBitmessage", None))
         self.labelVersion.setText(_translate("aboutDialog", "version ?", None))
-        self.label_2.setText(_translate("aboutDialog", "<html><head/><body><p>Copyright © 2012-2016 Jonathan Warren<br/>Copyright © 2013-2016 The Bitmessage Developers</p></body></html>", None))
+        self.label_2.setText(_translate("aboutDialog", "<html><head/><body><p>Copyright &copy; 2012-2016 Jonathan Warren<br/>Copyright &copy; 2013-2016 The Bitmessage Developers</p></body></html>", None))
         self.label_3.setText(_translate("aboutDialog", "<html><head/><body><p>Distributed under the MIT/X11 software license; see <a href=\"http://www.opensource.org/licenses/mit-license.php\"><span style=\" text-decoration: underline; color:#0000ff;\">http://www.opensource.org/licenses/mit-license.php</span></a></p></body></html>", None))
         self.label_5.setText(_translate("aboutDialog", "This is Beta software.", None))
 

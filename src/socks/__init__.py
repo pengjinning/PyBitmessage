@@ -63,7 +63,11 @@ _generalerrors = ("success",
     "not connected",
     "not available",
     "bad proxy type",
-    "bad input")
+    "bad input",
+    "timed out",
+    "network unreachable",
+    "connection refused",
+    "host unreachable")
 
 _socks5errors = ("succeeded",
     "general SOCKS server failure",
@@ -129,7 +133,10 @@ class socksocket(socket.socket):
         Receive EXACTLY the number of bytes requested from the socket.
         Blocks until the required number of bytes have been received.
         """
-        data = self.recv(count)
+        try:
+            data = self.recv(count)
+        except socket.timeout:
+            raise GeneralProxyError((6, "timed out"))
         while len(data) < count:
             d = self.recv(count-len(data))
             if not d: raise GeneralProxyError((0, "connection closed unexpectedly"))
@@ -299,6 +306,9 @@ class socksocket(socket.socket):
         """
         return self.__proxypeername
 
+    def getproxytype(self):
+        return self.__proxy[0]
+
     def __negotiatesocks4(self,destaddr,destport):
         """__negotiatesocks4(self,destaddr,destport)
         Negotiates a connection through a SOCKS4 server.
@@ -393,7 +403,19 @@ class socksocket(socket.socket):
                 portnum = self.__proxy[2]
             else:
                 portnum = 1080
-            _orgsocket.connect(self, (self.__proxy[1], portnum))
+            try:
+                _orgsocket.connect(self, (self.__proxy[1], portnum))
+            except socket.error as e:
+                # ENETUNREACH, WSAENETUNREACH
+                if e[0] in [101, 10051]:
+                    raise GeneralProxyError((7, _generalerrors[7]))
+                # ECONNREFUSED, WSAECONNREFUSED
+                if e[0] in [111, 10061]:
+                    raise GeneralProxyError((8, _generalerrors[8]))
+                # EHOSTUNREACH, WSAEHOSTUNREACH
+                if e[0] in [113, 10065]:
+                    raise GeneralProxyError((9, _generalerrors[9]))
+                raise
             self.__negotiatesocks5()
             self.__connectsocks5(destpair[0], destpair[1])
         elif self.__proxy[0] == PROXY_TYPE_SOCKS4:
@@ -408,7 +430,19 @@ class socksocket(socket.socket):
                 portnum = self.__proxy[2]
             else:
                 portnum = 8080
-            _orgsocket.connect(self,(self.__proxy[1], portnum))
+            try:
+                _orgsocket.connect(self,(self.__proxy[1], portnum))
+            except socket.error as e:
+                # ENETUNREACH, WSAENETUNREACH
+                if e[0] in [101, 10051]:
+                    raise GeneralProxyError((7, _generalerrors[7]))
+                # ECONNREFUSED, WSAECONNREFUSED
+                if e[0] in [111, 10061]:
+                    raise GeneralProxyError((8, _generalerrors[8]))
+                # EHOSTUNREACH, WSAEHOSTUNREACH
+                if e[0] in [113, 10065]:
+                    raise GeneralProxyError((9, _generalerrors[9]))
+                raise
             self.__negotiatehttp(destpair[0], destpair[1])
         elif self.__proxy[0] == None:
             _orgsocket.connect(self, (destpair[0], destpair[1]))

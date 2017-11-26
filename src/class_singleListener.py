@@ -1,12 +1,16 @@
 import threading
 import shared
 import socket
+from bmconfigparser import BMConfigParser
 from class_sendDataThread import *
 from class_receiveDataThread import *
 import helper_bootstrap
 from helper_threading import *
+import protocol
 import errno
 import re
+
+import state
 
 # Only one singleListener thread will ever exist. It creates the
 # receiveDataThread and sendDataThread for each incoming connection. Note
@@ -27,7 +31,14 @@ class singleListener(threading.Thread, StoppableThread):
 
     def _createListenSocket(self, family):
         HOST = ''  # Symbolic name meaning all available interfaces
-        PORT = shared.config.getint('bitmessagesettings', 'port')
+        # If not sockslisten, but onionhostname defined, only listen on localhost
+        if not BMConfigParser().safeGetBoolean('bitmessagesettings', 'sockslisten') and ".onion" in BMConfigParser().get('bitmessagesettings', 'onionhostname'):
+            if family == socket.AF_INET6 and "." in BMConfigParser().get('bitmessagesettings', 'onionbindip'):
+                raise socket.error(errno.EINVAL, "Invalid mix of IPv4 and IPv6")
+            elif family == socket.AF_INET and ":" in BMConfigParser().get('bitmessagesettings', 'onionbindip'):
+                raise socket.error(errno.EINVAL, "Invalid mix of IPv4 and IPv6")
+            HOST = BMConfigParser().get('bitmessagesettings', 'onionbindip')
+        PORT = BMConfigParser().getint('bitmessagesettings', 'port')
         sock = socket.socket(family, socket.SOCK_STREAM)
         if family == socket.AF_INET6:
             # Make sure we can accept both IPv4 and IPv6 connections.
@@ -43,27 +54,33 @@ class singleListener(threading.Thread, StoppableThread):
     def stopThread(self):
         super(singleListener, self).stopThread()
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.connect(('127.0.0.1', shared.config.getint('bitmessagesettings', 'port')))
-            s.shutdown(socket.SHUT_RDWR)
-            s.close()
-        except:
-            pass
+        for ip in ('127.0.0.1', BMConfigParser().get('bitmessagesettings', 'onionbindip')):
+            try:
+                s.connect((ip, BMConfigParser().getint('bitmessagesettings', 'port')))
+                s.shutdown(socket.SHUT_RDWR)
+                s.close()
+                break
+            except:
+                pass
 
     def run(self):
         # If there is a trusted peer then we don't want to accept
         # incoming connections so we'll just abandon the thread
-        if shared.trustedPeer:
+        if state.trustedPeer:
             return
 
-        while shared.safeConfigGetBoolean('bitmessagesettings', 'dontconnect') and shared.shutdown == 0:
+        while BMConfigParser().safeGetBoolean('bitmessagesettings', 'dontconnect') and state.shutdown == 0:
             self.stop.wait(1)
         helper_bootstrap.dns()
         # We typically don't want to accept incoming connections if the user is using a
         # SOCKS proxy, unless they have configured otherwise. If they eventually select
         # proxy 'none' or configure SOCKS listening then this will start listening for
-        # connections.
-        while shared.config.get('bitmessagesettings', 'socksproxytype')[0:5] == 'SOCKS' and not shared.config.getboolean('bitmessagesettings', 'sockslisten') and shared.shutdown == 0:
+        # connections. But if on SOCKS and have an onionhostname, listen
+        # (socket is then only opened for localhost)
+        while BMConfigParser().get('bitmessagesettings', 'socksproxytype')[0:5] == 'SOCKS' and \
+            (not BMConfigParser().getboolean('bitmessagesettings', 'sockslisten') and \
+            ".onion" not in BMConfigParser().get('bitmessagesettings', 'onionhostname')) and \
+            state.shutdown == 0:
             self.stop.wait(5)
 
         logger.info('Listening for incoming connections.')
@@ -73,11 +90,13 @@ class singleListener(threading.Thread, StoppableThread):
         # we'll fall back to IPv4-only.
         try:
             sock = self._createListenSocket(socket.AF_INET6)
-        except socket.error, e:
+        except socket.error as e:
             if (isinstance(e.args, tuple) and
                 e.args[0] in (errno.EAFNOSUPPORT,
                               errno.EPFNOSUPPORT,
-                              errno.ENOPROTOOPT)):
+                              errno.EADDRNOTAVAIL,
+                              errno.ENOPROTOOPT,
+                              errno.EINVAL)):
                 sock = self._createListenSocket(socket.AF_INET)
             else:
                 raise
@@ -85,20 +104,31 @@ class singleListener(threading.Thread, StoppableThread):
         # regexp to match an IPv4-mapped IPv6 address
         mappedAddressRegexp = re.compile(r'^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$')
 
-        while shared.shutdown == 0:
+        while state.shutdown == 0:
             # We typically don't want to accept incoming connections if the user is using a
             # SOCKS proxy, unless they have configured otherwise. If they eventually select
             # proxy 'none' or configure SOCKS listening then this will start listening for
             # connections.
-            while shared.config.get('bitmessagesettings', 'socksproxytype')[0:5] == 'SOCKS' and not shared.config.getboolean('bitmessagesettings', 'sockslisten') and shared.shutdown == 0:
+            while BMConfigParser().get('bitmessagesettings', 'socksproxytype')[0:5] == 'SOCKS' and not BMConfigParser().getboolean('bitmessagesettings', 'sockslisten') and ".onion" not in BMConfigParser().get('bitmessagesettings', 'onionhostname') and state.shutdown == 0:
                 self.stop.wait(10)
-            while len(shared.connectedHostsList) > 220 and shared.shutdown == 0:
+            while len(shared.connectedHostsList) > \
+                BMConfigParser().safeGetInt("bitmessagesettings", "maxtotalconnections", 200) + \
+                BMConfigParser().safeGetInt("bitmessagesettings", "maxbootstrapconnections", 20) \
+                and state.shutdown == 0:
                 logger.info('We are connected to too many people. Not accepting further incoming connections for ten seconds.')
 
                 self.stop.wait(10)
 
-            while shared.shutdown == 0:
-                socketObject, sockaddr = sock.accept()
+            while state.shutdown == 0:
+                try:
+                    socketObject, sockaddr = sock.accept()
+                except socket.error as e:
+                    if isinstance(e.args, tuple) and \
+                        e.args[0] in (errno.EINTR,):
+                        continue
+                    time.wait(1)
+                    continue
+
                 (HOST, PORT) = sockaddr[0:2]
 
                 # If the address is an IPv4-mapped IPv6 address then
@@ -112,25 +142,26 @@ class singleListener(threading.Thread, StoppableThread):
                 # is already connected because the two computers will
                 # share the same external IP. This is here to prevent
                 # connection flooding.
-                if HOST in shared.connectedHostsList:
+                # permit repeated connections from Tor
+                if HOST in shared.connectedHostsList and \
+                    (".onion" not in BMConfigParser().get('bitmessagesettings', 'onionhostname') or not protocol.checkSocksIP(HOST)):
                     socketObject.close()
                     logger.info('We are already connected to ' + str(HOST) + '. Ignoring connection.')
                 else:
                     break
 
-            someObjectsOfWhichThisRemoteNodeIsAlreadyAware = {} # This is not necessairly a complete list; we clear it from time to time to save memory.
             sendDataThreadQueue = Queue.Queue() # Used to submit information to the send data thread for this connection.
             socketObject.settimeout(20)
 
             sd = sendDataThread(sendDataThreadQueue)
             sd.setup(
-                socketObject, HOST, PORT, -1, someObjectsOfWhichThisRemoteNodeIsAlreadyAware)
+                socketObject, HOST, PORT, -1)
             sd.start()
 
             rd = receiveDataThread()
             rd.daemon = True  # close the main program even if there are threads left
             rd.setup(
-                socketObject, HOST, PORT, -1, someObjectsOfWhichThisRemoteNodeIsAlreadyAware, self.selfInitiatedConnections, sendDataThreadQueue, sd.objectHashHolderInstance)
+                socketObject, HOST, PORT, -1, self.selfInitiatedConnections, sendDataThreadQueue, sd.objectHashHolderInstance)
             rd.start()
 
             logger.info('connected to ' + HOST + ' during INCOMING request.')

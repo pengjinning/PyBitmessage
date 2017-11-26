@@ -5,11 +5,12 @@
 import sqlite3
 from time import strftime, localtime
 import sys
-import shared
-import string
+import paths
+import queues
+import state
 from binascii import hexlify
 
-appdata = shared.lookupAppdataFolder()
+appdata = paths.lookupAppdataFolder()
 
 conn = sqlite3.connect( appdata + 'messages.dat' )
 conn.text_factory = str
@@ -86,7 +87,7 @@ def markAllInboxMessagesAsUnread():
     cur.execute(item, parameters)
     output = cur.fetchall()
     conn.commit()
-    shared.UISignalQueue.put(('changedInboxUnread', None))
+    queues.UISignalQueue.put(('changedInboxUnread', None))
     print 'done'
 
 def vacuum():

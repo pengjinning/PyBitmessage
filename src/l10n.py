@@ -1,8 +1,9 @@
 
 import logging
+import os
 import time
 
-import shared
+from bmconfigparser import BMConfigParser
 
 
 #logger = logging.getLogger(__name__)
@@ -47,8 +48,8 @@ except:
     logger.exception('Could not determine language or encoding')
 
 
-if shared.config.has_option('bitmessagesettings', 'timeformat'):
-    time_format = shared.config.get('bitmessagesettings', 'timeformat')
+if BMConfigParser().has_option('bitmessagesettings', 'timeformat'):
+    time_format = BMConfigParser().get('bitmessagesettings', 'timeformat')
     #Test the format string
     try:
         time.strftime(time_format)
@@ -78,6 +79,11 @@ if time_format != DEFAULT_TIME_FORMAT:
         time_format = DEFAULT_TIME_FORMAT
         encoding = DEFAULT_ENCODING
 
+def setlocale(category, newlocale):
+    locale.setlocale(category, newlocale)
+    # it looks like some stuff isn't initialised yet when this is called the
+    # first time and its init gets the locale settings from the environment
+    os.environ["LC_ALL"] = newlocale
 
 def formatTimestamp(timestamp = None, as_unicode = True):
     #For some reason some timestamps are strings so we need to sanitize.
@@ -106,8 +112,8 @@ def formatTimestamp(timestamp = None, as_unicode = True):
 
 def getTranslationLanguage():
     userlocale = None
-    if shared.config.has_option('bitmessagesettings', 'userlocale'):
-        userlocale = shared.config.get('bitmessagesettings', 'userlocale')
+    if BMConfigParser().has_option('bitmessagesettings', 'userlocale'):
+        userlocale = BMConfigParser().get('bitmessagesettings', 'userlocale')
 
     if userlocale in [None, '', 'system']:
         return language

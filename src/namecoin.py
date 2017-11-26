@@ -20,13 +20,20 @@
 # SOFTWARE.
 
 import base64
+import httplib
 import json
 import socket
 import sys
 import os
 
-import shared
+from bmconfigparser import BMConfigParser
+import defaults
 import tr # translate
+
+# FIXME: from debug import logger crashes PyBitmessage due to a circular
+# dependency. The debug module will also override/disable logging.getLogger()
+# loggers so module level logging functions are used instead
+import logging as logger
 
 configSection = "bitmessagesettings"
 
@@ -36,6 +43,9 @@ class RPCError (Exception):
 
     def __init__ (self, data):
         self.error = data
+        
+    def __str__(self):
+        return '{0}: {1}'.format(type(self).__name__, self.error)
 
 # This class handles the Namecoin identity integration.
 class namecoinConnection (object):
@@ -46,6 +56,7 @@ class namecoinConnection (object):
     nmctype = None
     bufsize = 4096
     queryid = 1
+    con = None
 
     # Initialise.  If options are given, take the connection settings from
     # them instead of loading from the configs.  This can be used to test
@@ -53,20 +64,22 @@ class namecoinConnection (object):
     # actually changing the values (yet).
     def __init__ (self, options = None):
         if options is None:
-          self.nmctype = shared.config.get (configSection, "namecoinrpctype")
-          self.host = shared.config.get (configSection, "namecoinrpchost")
-          self.port = shared.config.get (configSection, "namecoinrpcport")
-          self.user = shared.config.get (configSection, "namecoinrpcuser")
-          self.password = shared.config.get (configSection,
+          self.nmctype = BMConfigParser().get (configSection, "namecoinrpctype")
+          self.host = BMConfigParser().get (configSection, "namecoinrpchost")
+          self.port = int(BMConfigParser().get (configSection, "namecoinrpcport"))
+          self.user = BMConfigParser().get (configSection, "namecoinrpcuser")
+          self.password = BMConfigParser().get (configSection,
                                              "namecoinrpcpassword")
         else:
           self.nmctype = options["type"]
           self.host = options["host"]
-          self.port = options["port"]
+          self.port = int(options["port"])
           self.user = options["user"]
           self.password = options["password"]
 
         assert self.nmctype == "namecoind" or self.nmctype == "nmcontrol"
+        if self.nmctype == "namecoind":
+            self.con = httplib.HTTPConnection(self.host, self.port, timeout = 3)
 
     # Query for the bitmessage address corresponding to the given identity
     # string.  If it doesn't contain a slash, id/ is prepended.  We return
@@ -85,25 +98,32 @@ class namecoinConnection (object):
                 res = self.callRPC ("data", ["getValue", string])
                 res = res["reply"]
                 if res == False:
-                    raise RPCError ({"code": -4})
+                    return (tr._translate("MainWindow",'The name %1 was not found.').arg(unicode(string)), None)
             else:
                 assert False
         except RPCError as exc:
-            if exc.error["code"] == -4:
-                return (tr._translate("MainWindow",'The name %1 was not found.').arg(unicode(string)), None)
+            logger.exception("Namecoin query RPC exception")
+            if isinstance(exc.error, dict):
+                errmsg = exc.error["message"]
             else:
-                return (tr._translate("MainWindow",'The namecoin query failed (%1)').arg(unicode(exc.error["message"])), None)
+                errmsg = exc.error
+            return (tr._translate("MainWindow",'The namecoin query failed (%1)').arg(unicode(errmsg)), None)
         except Exception as exc:
-            print "Namecoin query exception: %s" % str (exc)
+            logger.exception("Namecoin query exception")
             return (tr._translate("MainWindow",'The namecoin query failed.'), None)
 
         try:
             val = json.loads (res)
         except:
+            logger.exception("Namecoin query json exception")
             return (tr._translate("MainWindow",'The name %1 has no valid JSON data.').arg(unicode(string)), None)            
 
         if "bitmessage" in val:
-            return (None, val["bitmessage"])
+            if "name" in val:
+                ret = "%s <%s>" % (val["name"], val["bitmessage"])
+            else:
+                ret = val["bitmessage"]
+            return (None, ret)
         return (tr._translate("MainWindow",'The name %1 has no associated Bitmessage address.').arg(unicode(string)), None) 
 
     # Test the connection settings.  This routine tries to query a "getinfo"
@@ -132,14 +152,14 @@ class namecoinConnection (object):
                 if ("reply" in res) and res["reply"][:len(prefix)] == prefix:
                     return ('success', tr._translate("MainWindow",'Success!  NMControll is up and running.'))
 
-                print "Unexpected nmcontrol reply: %s" % res
+                logger.error("Unexpected nmcontrol reply: %s", res)
                 return ('failed',  tr._translate("MainWindow",'Couldn\'t understand NMControl.'))
 
             else:
                 assert False
 
-        except Exception as exc:
-            print "Namecoin connection test: %s" % str (exc)
+        except Exception:
+            logger.info("Namecoin connection test failure")
             return ('failed', "The connection to namecoin failed.")
 
     # Helper routine that actually performs an JSON RPC call.
@@ -155,35 +175,43 @@ class namecoinConnection (object):
 
         if val["id"] != self.queryid:
             raise Exception ("ID mismatch in JSON RPC answer.")
-        self.queryid = self.queryid + 1
+        
+        if self.nmctype == "namecoind":
+            self.queryid = self.queryid + 1
 
-        if val["error"] is not None:
-            raise RPCError (val["error"])
+        error = val["error"]
+        if error is None:
+            return val["result"]
 
-        return val["result"]
+        if isinstance(error, bool):
+            raise RPCError (val["result"])
+        raise RPCError (error)
 
     # Query the server via HTTP.
     def queryHTTP (self, data):
-        header = "POST / HTTP/1.1\n"
-        header += "User-Agent: bitmessage\n"
-        header += "Host: %s\n" % self.host
-        header += "Content-Type: application/json\n"
-        header += "Content-Length: %d\n" % len (data)
-        header += "Accept: application/json\n"
-        authstr = "%s:%s" % (self.user, self.password)
-        header += "Authorization: Basic %s\n" % base64.b64encode (authstr)
-
-        resp = self.queryServer ("%s\n%s" % (header, data))
-        lines = resp.split ("\r\n")
         result = None
-        body = False
-        for line in lines:
-            if line == "" and not body:
-                body = True
-            elif body:
-                if result is not None:
-                    raise Exception ("Expected a single line in HTTP response.")
-                result = line
+
+        try:
+            self.con.putrequest("POST", "/")
+            self.con.putheader("Connection", "Keep-Alive")
+            self.con.putheader("User-Agent", "bitmessage")
+            self.con.putheader("Host", self.host)
+            self.con.putheader("Content-Type", "application/json")
+            self.con.putheader("Content-Length", str(len(data)))
+            self.con.putheader("Accept", "application/json")
+            authstr = "%s:%s" % (self.user, self.password)
+            self.con.putheader("Authorization", "Basic %s" % base64.b64encode (authstr))
+            self.con.endheaders()
+            self.con.send(data)
+            try:
+                resp = self.con.getresponse()
+                result = resp.read()
+                if resp.status != 200:
+                    raise Exception ("Namecoin returned status %i: %s", resp.status, resp.reason)
+            except:
+                logger.info("HTTP receive error")
+        except:
+            logger.info("HTTP connection error")
 
         return result
 
@@ -193,7 +221,7 @@ class namecoinConnection (object):
             s = socket.socket (socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.settimeout(3) 
-            s.connect ((self.host, int (self.port)))
+            s.connect ((self.host, self.port))
             s.sendall (data)
             result = ""
 
@@ -234,21 +262,21 @@ def lookupNamecoinFolder ():
 # Ensure all namecoin options are set, by setting those to default values
 # that aren't there.
 def ensureNamecoinOptions ():
-    if not shared.config.has_option (configSection, "namecoinrpctype"):
-        shared.config.set (configSection, "namecoinrpctype", "namecoind")
-    if not shared.config.has_option (configSection, "namecoinrpchost"):
-        shared.config.set (configSection, "namecoinrpchost", "localhost")
+    if not BMConfigParser().has_option (configSection, "namecoinrpctype"):
+        BMConfigParser().set (configSection, "namecoinrpctype", "namecoind")
+    if not BMConfigParser().has_option (configSection, "namecoinrpchost"):
+        BMConfigParser().set (configSection, "namecoinrpchost", "localhost")
 
-    hasUser = shared.config.has_option (configSection, "namecoinrpcuser")
-    hasPass = shared.config.has_option (configSection, "namecoinrpcpassword")
-    hasPort = shared.config.has_option (configSection, "namecoinrpcport")
+    hasUser = BMConfigParser().has_option (configSection, "namecoinrpcuser")
+    hasPass = BMConfigParser().has_option (configSection, "namecoinrpcpassword")
+    hasPort = BMConfigParser().has_option (configSection, "namecoinrpcport")
 
     # Try to read user/password from .namecoin configuration file.
     defaultUser = ""
     defaultPass = ""
+    nmcFolder = lookupNamecoinFolder ()
+    nmcConfig = nmcFolder + "namecoin.conf"
     try:
-        nmcFolder = lookupNamecoinFolder ()
-        nmcConfig = nmcFolder + "namecoin.conf"
         nmc = open (nmcConfig, "r")
 
         while True:
@@ -265,20 +293,21 @@ def ensureNamecoinOptions ():
                 if key == "rpcpassword" and not hasPass:
                     defaultPass = val
                 if key == "rpcport":
-                    shared.namecoinDefaultRpcPort = val
+                    defaults.namecoinDefaultRpcPort = val
                 
         nmc.close ()
-
+    except IOError:
+        logger.error("%s unreadable or missing, Namecoin support deactivated", nmcConfig)
     except Exception as exc:
-        print "Could not read the Namecoin config file probably because you don't have Namecoin installed. That's ok; we don't really need it. Detailed error message: %s" % str (exc)
+        logger.warning("Error processing namecoin.conf", exc_info=True)
 
     # If still nothing found, set empty at least.
     if (not hasUser):
-        shared.config.set (configSection, "namecoinrpcuser", defaultUser)
+        BMConfigParser().set (configSection, "namecoinrpcuser", defaultUser)
     if (not hasPass):
-        shared.config.set (configSection, "namecoinrpcpassword", defaultPass)
+        BMConfigParser().set (configSection, "namecoinrpcpassword", defaultPass)
 
     # Set default port now, possibly to found value.
     if (not hasPort):
-        shared.config.set (configSection, "namecoinrpcport",
-                           shared.namecoinDefaultRpcPort)
+        BMConfigParser().set (configSection, "namecoinrpcport",
+                           defaults.namecoinDefaultRpcPort)

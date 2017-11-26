@@ -1,17 +1,23 @@
+import errno
 import time
 import threading
-import shared
 import Queue
 from struct import unpack, pack
 import hashlib
 import random
-import sys
+import select
 import socket
+from ssl import SSLError, SSL_ERROR_WANT_WRITE
+import sys
 
 from helper_generic import addDataPadding
 from class_objectHashHolder import *
 from addresses import *
 from debug import logger
+from inventory import PendingUpload
+import protocol
+import state
+import throttle
 
 # Every connection to a peer has a sendDataThread (and also a
 # receiveDataThread).
@@ -20,9 +26,10 @@ class sendDataThread(threading.Thread):
     def __init__(self, sendDataThreadQueue):
         threading.Thread.__init__(self, name="sendData")
         self.sendDataThreadQueue = sendDataThreadQueue
-        shared.sendDataQueues.append(self.sendDataThreadQueue)
+        state.sendDataQueues.append(self.sendDataThreadQueue)
         self.data = ''
         self.objectHashHolderInstance = objectHashHolder(self.sendDataThreadQueue)
+        self.objectHashHolderInstance.daemon = True
         self.objectHashHolderInstance.start()
         self.connectionIsOrWasFullyEstablished = False
 
@@ -32,29 +39,29 @@ class sendDataThread(threading.Thread):
         sock,
         HOST,
         PORT,
-        streamNumber,
-            someObjectsOfWhichThisRemoteNodeIsAlreadyAware):
+        streamNumber
+        ):
         self.sock = sock
-        self.peer = shared.Peer(HOST, PORT)
+        self.peer = state.Peer(HOST, PORT)
         self.name = "sendData-" + self.peer.host.replace(":", ".") # log parser field separator
-        self.streamNumber = streamNumber
+        self.streamNumber = []
         self.services = 0
+        self.buffer = ""
         self.initiatedConnection = False
         self.remoteProtocolVersion = - \
             1  # This must be set using setRemoteProtocolVersion command which is sent through the self.sendDataThreadQueue queue.
         self.lastTimeISentData = int(
             time.time())  # If this value increases beyond five minutes ago, we'll send a pong message to keep the connection alive.
-        self.someObjectsOfWhichThisRemoteNodeIsAlreadyAware = someObjectsOfWhichThisRemoteNodeIsAlreadyAware
-        if self.streamNumber == -1:  # This was an incoming connection.
+        if streamNumber == -1:  # This was an incoming connection.
             self.initiatedConnection = False
         else:
             self.initiatedConnection = True
-        logger.debug('The streamNumber of this sendDataThread (ID: ' + str(id(self)) + ') at setup() is' + str(self.streamNumber))
+        #logger.debug('The streamNumber of this sendDataThread (ID: ' + str(id(self)) + ') at setup() is' + str(self.streamNumber))
 
 
     def sendVersionMessage(self):
-        datatosend = shared.assembleVersionMessage(
-            self.peer.host, self.peer.port, self.streamNumber, not self.initiatedConnection)  # the IP and port of the remote host, and my streamNumber.
+        datatosend = protocol.assembleVersionMessage(
+            self.peer.host, self.peer.port, state.streamsInWhichIAmParticipating, not self.initiatedConnection)  # the IP and port of the remote host, and my streamNumber.
 
         logger.debug('Sending version packet: ' + repr(datatosend))
 
@@ -66,45 +73,52 @@ class sendDataThread(threading.Thread):
             
         self.versionSent = 1
 
-    def sendBytes(self, data):
-        if shared.config.getint('bitmessagesettings', 'maxuploadrate') == 0:
-            uploadRateLimitBytes = 999999999 # float("inf") doesn't work
-        else:
-            uploadRateLimitBytes = shared.config.getint('bitmessagesettings', 'maxuploadrate') * 1000
-        with shared.sendDataLock:
-            while data:
-                while shared.numberOfBytesSentLastSecond >= uploadRateLimitBytes:
-                    if int(time.time()) == shared.lastTimeWeResetBytesSent:
-                        time.sleep(0.3)
-                    else:
-                        # It's a new second. Let us clear the shared.numberOfBytesSentLastSecond
-                        shared.lastTimeWeResetBytesSent = int(time.time())
-                        shared.numberOfBytesSentLastSecond = 0
-                        # If the user raises or lowers the uploadRateLimit then we should make use of
-                        # the new setting. If we are hitting the limit then we'll check here about 
-                        # once per second.
-                        if shared.config.getint('bitmessagesettings', 'maxuploadrate') == 0:
-                            uploadRateLimitBytes = 999999999 # float("inf") doesn't work
-                        else:
-                            uploadRateLimitBytes = shared.config.getint('bitmessagesettings', 'maxuploadrate') * 1000
-                if ((self.services & shared.NODE_SSL == shared.NODE_SSL) and
-                    self.connectionIsOrWasFullyEstablished and
-                    shared.haveSSL(not self.initiatedConnection)):
-                    amountSent = self.sslSock.send(data[:1000])
-                else:
-                    amountSent = self.sock.send(data[:1000])
-                shared.numberOfBytesSent += amountSent # used for the 'network status' tab in the UI
-                shared.numberOfBytesSentLastSecond += amountSent
-                self.lastTimeISentData = int(time.time())
-                data = data[amountSent:]
+    def sendBytes(self, data = ""):
+        self.buffer += data
+        if len(self.buffer) < throttle.SendThrottle().chunkSize and self.sendDataThreadQueue.qsize() > 1:
+            return True
 
+        while self.buffer and state.shutdown == 0:
+            isSSL = False
+            try:
+                if ((self.services & protocol.NODE_SSL == protocol.NODE_SSL) and
+                    self.connectionIsOrWasFullyEstablished and
+                    protocol.haveSSL(not self.initiatedConnection)):
+                    isSSL = True
+                    amountSent = self.sslSock.send(self.buffer[:throttle.SendThrottle().chunkSize])
+                else:
+                    amountSent = self.sock.send(self.buffer[:throttle.SendThrottle().chunkSize])
+            except socket.timeout:
+                continue
+            except SSLError as e:
+                if e.errno == SSL_ERROR_WANT_WRITE:
+                    select.select([], [self.sslSock], [], 10)
+                    logger.debug('sock.recv retriable SSL error')
+                    continue
+                logger.debug('Connection error (SSL)')
+                return False
+            except socket.error as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK) or \
+                    (sys.platform.startswith('win') and \
+                    e.errno == errno.WSAEWOULDBLOCK):
+                    select.select([], [self.sslSock if isSSL else self.sock], [], 10)
+                    logger.debug('sock.recv retriable error')
+                    continue
+                if e.errno in (errno.EPIPE, errno.ECONNRESET, errno.EHOSTUNREACH, errno.ETIMEDOUT, errno.ECONNREFUSED):
+                    logger.debug('Connection error: %s', str(e))
+                    return False
+                raise
+            throttle.SendThrottle().wait(amountSent)
+            self.lastTimeISentData = int(time.time())
+            self.buffer = self.buffer[amountSent:]
+        return True
 
     def run(self):
-        logger.debug('sendDataThread starting. ID: ' + str(id(self)) + '. Number of queues in sendDataQueues: ' + str(len(shared.sendDataQueues)))
-        while True:
+        logger.debug('sendDataThread starting. ID: ' + str(id(self)) + '. Number of queues in sendDataQueues: ' + str(len(state.sendDataQueues)))
+        while self.sendBytes():
             deststream, command, data = self.sendDataThreadQueue.get()
 
-            if deststream == self.streamNumber or deststream == 0:
+            if deststream == 0 or deststream in self.streamNumber:
                 if command == 'shutdown':
                     logger.debug('sendDataThread (associated with ' + str(self.peer) + ') ID: ' + str(id(self)) + ' shutting down now.')
                     break
@@ -116,7 +130,7 @@ class sendDataThread(threading.Thread):
                 # streamNumber of this send data thread here:
                 elif command == 'setStreamNumber':
                     self.streamNumber = data
-                    logger.debug('setting the stream number in the sendData thread (ID: ' + str(id(self)) + ') to ' + str(self.streamNumber))
+                    logger.debug('setting the stream number to %s', ', '.join(str(x) for x in self.streamNumber))
                 elif command == 'setRemoteProtocolVersion':
                     specifiedRemoteProtocolVersion = data
                     logger.debug('setting the remote node\'s protocol version in the sendDataThread (ID: ' + str(id(self)) + ') to ' + str(specifiedRemoteProtocolVersion))
@@ -134,11 +148,11 @@ class sendDataThread(threading.Thread):
                             payload += pack('>I', streamNumber)
                             payload += pack(
                                 '>q', services)  # service bit flags offered by this node
-                            payload += shared.encodeHost(host)
+                            payload += protocol.encodeHost(host)
                             payload += pack('>H', port)
     
                         payload = encodeVarint(numberOfAddressesInAddrMessage) + payload
-                        packet = shared.CreatePacket('addr', payload)
+                        packet = protocol.CreatePacket('addr', payload)
                         try:
                             self.sendBytes(packet)
                         except:
@@ -150,44 +164,53 @@ class sendDataThread(threading.Thread):
                     if self.connectionIsOrWasFullyEstablished: # only send inv messages if we have send and heard a verack from the remote node
                         payload = ''
                         for hash in data:
-                            if hash not in self.someObjectsOfWhichThisRemoteNodeIsAlreadyAware:
-                                payload += hash
+                            payload += hash
                         if payload != '':
                             payload = encodeVarint(len(payload)/32) + payload
-                            packet = shared.CreatePacket('inv', payload)
+                            packet = protocol.CreatePacket('inv', payload)
                             try:
                                 self.sendBytes(packet)
                             except:
                                 logger.error('sendinv: self.sock.sendall failed')
                                 break
                 elif command == 'pong':
-                    self.someObjectsOfWhichThisRemoteNodeIsAlreadyAware.clear() # To save memory, let us clear this data structure from time to time. As its function is to help us keep from sending inv messages to peers which sent us the same inv message mere seconds earlier, it will be fine to clear this data structure from time to time.
                     if self.lastTimeISentData < (int(time.time()) - 298):
                         # Send out a pong message to keep the connection alive.
                         logger.debug('Sending pong to ' + str(self.peer) + ' to keep connection alive.')
-                        packet = shared.CreatePacket('pong')
+                        packet = protocol.CreatePacket('pong')
                         try:
                             self.sendBytes(packet)
                         except:
                             logger.error('send pong failed')
                             break
                 elif command == 'sendRawData':
+                    objectHash = None
+                    if type(data) in [list, tuple]:
+                        objectHash, data = data
                     try:
                         self.sendBytes(data)
+                        PendingUpload().delete(objectHash)
                     except:
-                        logger.error('Sending of data to ' + str(self.peer) + ' failed. sendDataThread thread ' + str(self) + ' ending now.')
+                        logger.error('Sending of data to ' + str(self.peer) + ' failed. sendDataThread thread ' + str(self) + ' ending now.', exc_info=True)
                         break
                 elif command == 'connectionIsOrWasFullyEstablished':
                     self.connectionIsOrWasFullyEstablished = True
                     self.services, self.sslSock = data
-            else:
-                logger.error('sendDataThread ID: ' + str(id(self)) + ' ignoring command ' + command + ' because the thread is not in stream' + str(deststream))
+            elif self.connectionIsOrWasFullyEstablished:
+                logger.error('sendDataThread ID: ' + str(id(self)) + ' ignoring command ' + command + ' because the thread is not in stream ' + str(deststream) + ' but in streams ' + ', '.join(str(x) for x in self.streamNumber))
+            self.sendDataThreadQueue.task_done()
+        # Flush if the cycle ended with break
+        try:
+            self.sendDataThreadQueue.task_done()
+        except ValueError:
+            pass
 
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
             self.sock.close()
         except:
             pass
-        shared.sendDataQueues.remove(self.sendDataThreadQueue)
-        logger.info('sendDataThread ending. ID: ' + str(id(self)) + '. Number of queues in sendDataQueues: ' + str(len(shared.sendDataQueues)))
+        state.sendDataQueues.remove(self.sendDataThreadQueue)
+        PendingUpload().threadEnd()
+        logger.info('sendDataThread ending. ID: ' + str(id(self)) + '. Number of queues in sendDataQueues: ' + str(len(state.sendDataQueues)))
         self.objectHashHolderInstance.close()

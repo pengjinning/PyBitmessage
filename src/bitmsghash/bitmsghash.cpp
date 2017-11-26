@@ -11,7 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined (__DragonFly__) || defined (__OpenBSD__) || defined (__NetBSD__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
@@ -66,7 +66,11 @@ void * threadfunc(void* param) {
 			successval = tmpnonce;
 		}
 	}
+#ifdef _WIN32
+	return 0;
+#else
 	return NULL;
+#endif
 }
 
 void getnumthreads()
@@ -75,6 +79,10 @@ void getnumthreads()
 	DWORD_PTR dwProcessAffinity, dwSystemAffinity;
 #elif __linux__
 	cpu_set_t dwProcessAffinity;
+#elif __OpenBSD__
+	int mib[2], core_count = 0;
+	int dwProcessAffinity = 0;
+	size_t len2;
 #else
 	int dwProcessAffinity = 0;
 	int32_t core_count = 0;
@@ -86,21 +94,33 @@ void getnumthreads()
 	GetProcessAffinityMask(GetCurrentProcess(), &dwProcessAffinity, &dwSystemAffinity);
 #elif __linux__
 	sched_getaffinity(0, len, &dwProcessAffinity);
+#elif __OpenBSD__
+	len2 = sizeof(core_count);
+	mib[0] = CTL_HW;
+	mib[1] = HW_NCPU;
+	if (sysctl(mib, 2, &core_count, &len2, 0, 0) == 0)
+		numthreads = core_count;
 #else
 	if (sysctlbyname("hw.logicalcpu", &core_count, &len, 0, 0) == 0)
+		numthreads = core_count;
+	else if (sysctlbyname("hw.ncpu", &core_count, &len, 0, 0) == 0)
 		numthreads = core_count;
 #endif
 	for (unsigned int i = 0; i < len * 8; i++)
 #if defined(_WIN32)
-		if (dwProcessAffinity & (1i64 << i)) {
+#if defined(_MSC_VER)
+		if (dwProcessAffinity & (1i64 << i))
+#else // CYGWIN/MINGW
+		if (dwProcessAffinity & (1ULL << i))
+#endif
 #elif defined __linux__
-		if (CPU_ISSET(i, &dwProcessAffinity)) {
+		if (CPU_ISSET(i, &dwProcessAffinity))
 #else
-		if (dwProcessAffinity & (1 << i)) {
+		if (dwProcessAffinity & (1 << i))
 #endif
 			numthreads++;
-			printf("Detected core on: %u\n", i);
-		}
+	if (numthreads == 0) // something failed
+		numthreads = 1;
 	printf("Number of threads: %i\n", (int)numthreads);
 }
 
